@@ -1,0 +1,185 @@
+// Copyright 2023 Ben L. Titzer. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def INITIAL_VALUES = 128;
+def INITIAL_FRAMES = 16;
+def FINISHED_SENTINEL = Exception.new(null, null, null);
+
+// Implements an interpreter capable of executing all SSA instructions, calls, etc
+// for initialization and testing.
+class SsaInterpreter(prog: Program) {
+	var values = Array<Val>.new(INITIAL_VALUES);
+	var stack = Array<SsaIntFrame>.new(INITIAL_FRAMES);
+	var frame: SsaIntFrame;
+	def args = SsaIntArguments.new(prog);
+	var sp: int;
+	var retVal: Val;
+	var exception: Exception;
+
+	def run(spec: IrSpec, args: Array<Val>) -> Result {
+		frame = null;
+		exception = null;
+		retVal = null;
+		sp = 0;
+		
+		pushFrame(spec, null, args);
+		while (exception != null) {
+			frame.ip = step(frame.ip);
+		}
+		var result: Result = exception;
+		if (exception == FINISHED_SENTINEL) {
+			result = retVal;
+		} else if (exception == null) {
+			result = Exception.new(V3Exception.InternalError, "no exception returned in interpreter", getStackTrace());
+		}
+		return result;
+	}
+	def step(i: SsaInstr) -> SsaInstr {
+		match (i) {
+			x: SsaParam => return nextInstr(i);
+			x: SsaApplyOp => doOp(x);
+			x: SsaPhi => return nextInstr(i);
+			x: SsaGoto => {
+				doGoto(x.succs[0]);
+			}
+			x: SsaIf =>  {
+				var cond = getVal(x.inputs[0].dest);
+				var which = if(Bool.unbox(cond), 0, 1);
+				doGoto(x.succs[which]);
+			}
+			x: SsaSwitch => {
+				var key = getVal(x.inputs[0].dest);
+				var which = Int.unbox(key);
+				if (u32.view(which) >= u32.view(x.maxValue)) which = x.maxValue;
+				doGoto(x.succs[which]);
+			}
+			x: SsaReturn => {
+				var r = if(x.inputs.length > 0, getVal(x.inputs[0].dest));
+				if (sp == 1) {
+					exception = FINISHED_SENTINEL;
+					retVal = r;
+				} else {
+					frame = stack[--sp - 1];
+					setVal(frame.ip, r);
+					frame.ip = nextInstr(frame.ip);
+				}
+			}
+			x: SsaThrow => {
+				args.throw(x.exception, null);
+			}
+		}
+		return fail("unexpected SsaInstr type");
+	}
+	def getVal(i: SsaInstr) -> Val {
+		if (SsaConst.?(i)) return SsaConst.!(i).val;
+		if (i.valueNum < 0) allocValueNum(i);
+		return values[frame.fp + i.valueNum];
+	}
+	def setVal(i: SsaInstr, v: Val) {
+		if (i.valueNum < 0) allocValueNum(i);
+		values[frame.fp + i.valueNum] = v;
+		// TODO: if (Debug.paranoid) do a type check
+	}
+	def allocValueNum(i: SsaInstr) {
+		var g = frame.meth.ssa;
+		i.valueNum = g.numValues++;
+		if (frame.fp + g.numValues >= values.length) values = Arrays.grow(values, INITIAL_VALUES + values.length * 2);
+	}
+	def doGoto(target: SsaCfEdge) -> SsaInstr {
+		var block = frame.block = target.dest;
+		for (i = block.next; i != block; i = i.next) {
+			match (i) {
+				x: SsaPhi => setVal(x, getVal(x.inputs[target.desti].dest));
+				x: SsaInstr => return x;
+				_ => return fail("no SsaInstr successor");
+			}
+		}
+		return fail("fell off the end of the block");
+	}
+	def doOp(i: SsaApplyOp) {
+		args.args = Arrays.grow(args.args, i.inputs.length);
+		for (j < i.inputs.length) {
+			args.args[j] = getVal(i.inputs[j].dest);
+		}
+		args.nargs = i.inputs.length;
+		var r = Eval.doOp(i.op, args);
+		match (r) {
+			x: Exception => this.exception = x;
+			x: Val => setVal(i, x);
+			null => setVal(i, null);
+		}
+	}
+	def nextInstr(i: SsaLink) -> SsaInstr {
+		var n = i.next;
+		if (n == null) return fail("no instruction successor");
+		if (!SsaInstr.?(n)) return fail("successor is not an SsaInstr");
+		return SsaInstr.!(n);
+	}
+	def fail<T>(msg: string) -> T {
+		var d: T;
+		if (exception == null) {
+			var buf = StringBuilder.new().puts(msg);
+			if (frame != null) {
+				if (frame.ip != null) buf.put1(", near @%d", frame.ip.uid);
+				if (frame.block != null) buf.put1(", in block #%d", frame.block.uid);
+			}
+			exception = Exception.new("SsaEvalInternalError", buf.toString(), getStackTrace());
+		}
+		return d;
+	}
+	def getStackTrace() -> List<Source> {
+		return null; // TODO
+	}
+	def pushFrame(spec: IrSpec, recvr: Val, args: Range<Val>) {
+		if (sp >= stack.length) stack = Arrays.grow(stack, stack.length * 4);
+		frame = stack[sp++];
+		if (frame == null) frame = stack[sp - 1] = SsaIntFrame.new();
+		frame.meth = spec.asMethod();
+		frame.spec = spec;
+		frame.ip = nextInstr(frame.meth.ssa.startBlock);
+		frame.fp = 0; // TODO
+	}
+}
+class SsaIntArguments(prog: Program) extends Arguments {
+	var frame: SsaIntFrame;
+	var args: Array<Val>;
+	var nargs: int;
+	var typeArgs: Array<Type>;
+	var interpreter: SsaInterpreter;
+
+	def numArgs() -> int {
+		return nargs;
+	}
+	def getArg(i: int) -> Val {
+		return args[i];
+	}
+	def getType(i: int) -> Type {
+		var t = typeArgs[i];
+		if (t.open()) t = frame.spec.instantiateType(t);
+		return t;
+	}
+	def getTypes() -> Array<Type> {
+		return frame.spec.instantiateTypes(typeArgs);
+	}
+	def getProgram() -> Program {
+		return prog;
+	}
+	def tailCall(spec: IrSpec, recvr: Val, startArg: int, endArg: int) -> Result {
+		if (spec == null) {
+			interpreter.exception = Exception.new(V3Exception.NullCheck, "null function", interpreter.getStackTrace());
+		} else {
+			interpreter.pushFrame(spec, recvr, args[startArg ... endArg]);
+		}
+		return null;
+	}
+	def throw(ex: string, msg: string) -> Exception {
+		return interpreter.exception = Exception.new(ex, msg, interpreter.getStackTrace());
+	}
+}
+class SsaIntFrame {
+	var spec: IrSpec;
+	var meth: IrMethod;
+	var block: SsaBlock;
+	var ip: SsaInstr;
+	var fp: int;
+}
