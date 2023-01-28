@@ -98,7 +98,7 @@ class SsaPrinter {
 			printDest(e);
 		}
 	}
-	def printInstr(i: SsaInstr) {
+	def printInstr(i: SsaInstr, facts: bool) {
 		if (i == null) return putnull();
 		cyan("@%d", i.uid);
 		buf.putc(':');
@@ -135,11 +135,11 @@ class SsaPrinter {
 		}
 		if (args.length > 0) buf.putc(')');
 		buf.sp();
-		printFacts(i.facts);
+		if (facts) printFacts(i.facts);
 	}
 	def printInstrLn(i: SsaInstr) {
 		indent(2);
-		printInstr(i);
+		printInstr(i, true);
 		ln();
 	}
 	def printEnd(block: SsaBlock, end: SsaEnd) {
@@ -154,7 +154,8 @@ class SsaPrinter {
 					ln();
 				} else {
 					buf.red().puts("error").end();
-					return ln();
+					ln();
+					return;
 				}
 				indent(3);
 				buf.puts(" false => ");
@@ -241,7 +242,7 @@ class SsaPrinter {
 	def putnull() {
 		buf.red().puts("null").end();
 	}
-	def ln() {
+	def ln() -> this {
 		buf.ln();
 		if (buf.length > 1000) flush();
 	}

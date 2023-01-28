@@ -620,6 +620,10 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 			var spec = getIrSpec(method, args);
 			return args.tailCall(spec, object, 1, args.numArgs());
 		}
+		CallClosure => {
+			var del = Closure.!(args.getArg(0));
+			return args.tailCall(del.memberRef, del.val, 1, args.numArgs());
+		}
 		CallClassMethod(method) => {
 			var object = getRecordReceiver(args);
 			if (object == null) return args.throw(V3Exception.NullCheck, null);
