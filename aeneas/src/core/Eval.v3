@@ -706,6 +706,7 @@ def evalOp(op: Operator, args: Arguments) -> Result {
 		}
 		CallClosure => {
 			var del = Closure.!(args.getArg(0));
+			if (del == null) return args.throw(V3Exception.NullCheck, null);
 			return args.tailCall(del.memberRef, del.val, 1, args.numArgs());
 		}
 		CallClassMethod(method) => {

@@ -16,6 +16,7 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 	var exception: Exception;
 	var printer: SsaPrinter;
 	var tailCalled: bool;
+	var phiMoves = Vector<(SsaPhi, Val)>.new();
 
 	new() {
 		args.interpreter = this;
@@ -36,7 +37,7 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 			if (frame == null) break;
 			frame.ip = n;
 		}
-		
+		phiMoves.clear();
 		return if (exception == null, retVal, exception);
 	}
 	def setTrace(on: bool) {
@@ -145,14 +146,18 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 	}
 	private def doGoto(target: SsaCfEdge) -> SsaInstr {
 		var block = frame.block = target.dest;
+		var next: SsaInstr;
 		for (i = block.next; i != block; i = i.next) {
 			match (i) {
-				x: SsaPhi => setVal(x, getVal(x.inputs[target.desti].dest));
-				x: SsaInstr => return x;
+				x: SsaPhi => phiMoves.put(x, getVal(x.inputs[target.desti].dest));
+				x: SsaInstr => { next = x; break; }
 				_ => return fail("no SsaInstr successor");
 			}
 		}
-		return fail("fell off the end of the block");
+		// apply deferred phi moves
+		for (i < phiMoves.length) setVal(phiMoves[i]);
+		phiMoves.resize(0);
+		return if(next != null, next, fail("fell off the end of the block"));
 	}
 	private def doOp(i: SsaApplyOp) -> SsaInstr {
 		var n = nextInstr(i);
@@ -243,8 +248,46 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 			printer.buf.puts("=");
 			printer.buf.putv(recvr, param.getType());
 		}
-		for (i = 1; i < ssa.params.length; i++) {
-			var param = ssa.params[i], arg = args[i - 1];
+		setArgs(ssa.params[1 ...], args);
+		if (printer != null) {
+			printer.buf.puts(")");
+			printer.outln();
+		}
+	}
+	def setArgs(params: Range<SsaParam>, args: Range<Val>) {
+		if (params.length == 0) return; // no parameters, nothing to do
+		if (params.length == args.length) return setArgs0(params, args); // no adjustment necessary
+		if (args.length == 0) {
+			// pass all BOTTOMs
+			for (p in params) setVal(p, Values.BOTTOM);
+			return;
+		}
+		if (params.length == 1) {
+			// collapse into tuple
+			var vals = Array<Val>.new(args.length);
+			for (i < vals.length) vals[i] = args[i]; // XXX: manual array copy
+			setVal(params[0], TupleVal.new(vals));
+			return;
+		}
+		// Deal with fewer arguments than parameters by expanding the last tuple.
+		var last = args.length - 1;
+		setArgs0(params[0 ... last], args[0 ... last]);
+		match (args[last]) {
+			x: TupleVal => {
+				// expand tuple
+				for (j = last; j < params.length; j++) {
+					setVal(params[j], x.values[j - last]);
+				}
+			}
+			_ => {
+				// pass all BOTTOMS
+				while (last < params.length) setVal(params[last++], Values.BOTTOM);
+			}
+		}
+	}
+	def setArgs0(params: Range<SsaParam>, args: Range<Val>) {
+		for (i < params.length) {
+			var param = params[i], arg = args[i];
 			setVal(param, arg);
 			if (printer != null) {
 				printer.buf.csp();
@@ -252,10 +295,6 @@ class SsaInterpreter(prog: Program, genSsa: (IrSpec, int) -> SsaGraph) {
 				printer.buf.puts("=");
 				printer.buf.putv(arg, param.getType());
 			}
-		}
-		if (printer != null) {
-			printer.buf.puts(")");
-			printer.outln();
 		}
 	}
 	def popFrame() -> SsaIntFrame {
